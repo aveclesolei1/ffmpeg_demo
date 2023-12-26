@@ -1,23 +1,26 @@
 #include <stdio.h>
-#include <SDL.h>
+#include <string.h>
+#include <SDL2/SDL.h>
 #define BUFFER_SIZE 4096000
-static Uint8* buf = NULL;
-static size_t len = 0;
-static Uint8* pos = NULL;
+#define BUFFER_REFRESH_SIZE 3072000//51200
 #undef main
 
-void read_audio_data(void* udata, Uint8* stream, int l) {
-	if (len == 0) {
+static Uint8* audio_buffer = NULL;
+static Uint8* audio_position = NULL;
+static size_t audio_buffer_len = 0;
+
+void read_audio_data(void* udata, Uint8* stream, int len) {
+	if (audio_buffer_len == 0) {
 		return;
 	}
 
-	SDL_memset(stream, 0, l);
+	SDL_memset(stream, 0, len);
 
-	l = (l < len) ? l : len;
-	SDL_MixAudio(stream, pos, l, SDL_MIX_MAXVOLUME);
+	len = (len < audio_buffer_len) ? len : audio_buffer_len;
+	SDL_MixAudio(stream, audio_position, len, SDL_MIX_MAXVOLUME);
 
-	pos += l;
-	len -= l;
+	audio_position += len;
+	audio_buffer_len -= len;
 }
 
 int main(int argc, char* argv[]) {
@@ -35,19 +38,19 @@ int main(int argc, char* argv[]) {
 	}
 	
 	file_name = argv[1];
-	if (!(file = fopen(file_name, "rb+"))) {
+	if (!(file = fopen(file_name, "rb"))) {
 		fprintf(stderr, "Failed to open input file\n");
 		goto end;
 	}
 	
-	buf = (Uint8*) malloc(BUFFER_SIZE);
-	if (!buf) {
+	audio_buffer = (Uint8*) malloc(BUFFER_SIZE);
+	if (!audio_buffer) {
 		fprintf(stderr, "Failed to malloc buffer\n");
 		goto end;
 	}
 
 	SDL_AudioSpec spec;
-	spec.freq = 48000;
+	spec.freq = 44100;
 	spec.channels = 2;
 	spec.format = AUDIO_F32LSB;
 	spec.silence = 0;
@@ -60,20 +63,49 @@ int main(int argc, char* argv[]) {
 	}
 
 	SDL_PauseAudio(0);
+	
+	/*
+	while(1) {
+	size_t read_length = fread(audio_buffer, 1, BUFFER_SIZE, file);
+		audio_position = audio_buffer;
+		audio_buffer_len = read_length;
+		if (read_length <= 0) {
+			printf("break\n");
+			break;
+		}
 
-	do {
-		len = fread(buf, 1, BUFFER_SIZE, file);
-		pos = buf;
-		while (pos < (buf + len)) {
+		while (audio_position < (audio_buffer + read_length)) {
 			SDL_Delay(1);
 		}
-	} while(1);
+	}
+	*/
+	size_t read_length = fread(audio_buffer, 1, BUFFER_SIZE, file);
+	audio_position = audio_buffer;
+	audio_buffer_len = read_length;
+
+	while(1) {
+		if (read_length <= 0) {
+			printf("there are audio_buffer_len: %zu\n", audio_buffer_len);
+			break;
+		}
+
+		while (audio_buffer_len > BUFFER_REFRESH_SIZE) {
+			SDL_Delay(1);
+		}
+
+		memmove(audio_buffer, audio_position, audio_buffer_len);
+		audio_position = audio_buffer;
+		read_length = fread(audio_buffer + audio_buffer_len, 1, BUFFER_SIZE - audio_buffer_len, file);
+		if (read_length > 0) {
+			audio_buffer_len += read_length;
+		}
+	}
 
 	SDL_CloseAudio();
-end:
 
-	if (buf) {
-		free(buf);
+end:
+	if (audio_buffer) {
+		free(audio_buffer);
 	}
 
 	if (file) {
