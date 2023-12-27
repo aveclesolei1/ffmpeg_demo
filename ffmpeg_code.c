@@ -2,9 +2,17 @@
 #include <libavformat/avformat.h>
 #include <libavcodec/packet.h>
 #include <libavcodec/avcodec.h>
+#include <libavutil/imgutils.h>
 
 #define STREAM_BUFFER_SIZE 20480
 #define STREAM_REFRESH_SIZE 4096
+
+static int video_frame_count;
+static uint8_t *video_dst_data[4] = {NULL};
+static int video_dst_linesize[4];
+static int video_dst_bufsize;
+static int width, height;
+static enum AVPixelFormat pix_fmt;
 
 static int get_format_from_sample_fmt(const char **fmt,
                                       enum AVSampleFormat sample_fmt)
@@ -35,7 +43,7 @@ static int get_format_from_sample_fmt(const char **fmt,
     return -1;
 }
 
-void decode(AVCodecContext* codec_ctx, AVPacket* pkt, AVFrame* frame, FILE* out_file) {
+void decode_audio(AVCodecContext* codec_ctx, AVPacket* pkt, AVFrame* frame, FILE* out_file) {
 	int i, ch;
 	int ret, data_size;
 
@@ -66,6 +74,59 @@ void decode(AVCodecContext* codec_ctx, AVPacket* pkt, AVFrame* frame, FILE* out_
                 fwrite(frame->data[ch] + data_size*i, 1, data_size, out_file);
             }
 	}
+}
+
+static void decode_video(AVCodecContext *dec_ctx, AVPacket *pkt, AVFrame *frame, FILE *out_file)
+{
+    int ret;
+ 
+    ret = avcodec_send_packet(dec_ctx, pkt);
+    if (ret < 0) {
+        fprintf(stderr, "Error sending a packet for decoding\n");
+        exit(1);
+    }
+ 
+    while (ret >= 0) {
+        ret = avcodec_receive_frame(dec_ctx, frame);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+            return;
+        else if (ret < 0) {
+            fprintf(stderr, "Error during decoding\n");
+            exit(1);
+        }
+ 
+        printf("saving frame %3"PRId64"\n", dec_ctx->frame_num);
+        fflush(stdout);
+ 
+        /* the picture is allocated by the decoder. no need to
+           free it */
+        //snprintf(buf, sizeof(buf), "%s-%"PRId64, filename, dec_ctx->frame_num);
+        if (frame->width != width || frame->height != height ||
+                frame->format != pix_fmt) {
+            /* To handle this change, one could call av_image_alloc again and
+            * decode the following frames into another rawvideo file. */
+            fprintf(stderr, "Error: Width, height and pixel format have to be "
+                    "constant in a rawvideo file, but the width, height or "
+                    "pixel format of the input video changed:\n"
+                    "old: width = %d, height = %d, format = %s\n"
+                    "new: width = %d, height = %d, format = %s\n",
+                    width, height, av_get_pix_fmt_name(pix_fmt),
+                    frame->width, frame->height,
+                    av_get_pix_fmt_name(frame->format));
+            return;
+        }
+    
+        printf("video_frame n:%d\n", video_frame_count++);
+    
+        /* copy decoded frame to destination buffer:
+        * this is required since rawvideo expects non aligned data */
+        av_image_copy(video_dst_data, video_dst_linesize,
+                    (const uint8_t **)(frame->data), frame->linesize,
+                    pix_fmt, width, height);
+    
+        /* write to rawvideo file */
+        fwrite(video_dst_data[0], 1, video_dst_bufsize, out_file);
+    }
 }
 
 void get_adts_header(char* adts_header_buf, const int frame_size) {
@@ -126,14 +187,14 @@ void get_adts_header(char* adts_header_buf, const int frame_size) {
 }
 
 int main(int argc, char* argv[]) {
-    AVFormatContext* ifmt_ctx = NULL, * ofmt_ctx = NULL;
-    AVCodecContext* codec_ctx = NULL;
-    const AVCodec* codec = NULL;
+    AVFormatContext* ifmt_ctx = NULL, * afmt_ctx = NULL, * vfmt_ctx;
+    AVCodecContext* acodec_ctx = NULL, * vcodec_ctx = NULL;
+    const AVCodec* acodec = NULL, * vcodec = NULL;
     AVPacket* pkt = NULL;
     AVFrame* frame = NULL;
-    AVCodecParserContext* parser_ctx = NULL;
-    FILE* in_file, * out_file;
-    char* in_filename, * out_filename, * data;
+    AVStream* stream = NULL;
+    FILE* in_file, * audio_out_file, * video_out_file;
+    char* in_filename, * audio_out_filename, * video_out_filename, * data;
     char buf[STREAM_BUFFER_SIZE + STREAM_REFRESH_SIZE], header_buf[7];
     size_t data_size;
     int ret, audio_stream_index, video_stream_index;
@@ -141,13 +202,14 @@ int main(int argc, char* argv[]) {
     enum AVSampleFormat sfmt;
     const char *fmt;
 
-    if (argc < 3) {
-        fprintf(stderr, "Using the following command: %s <input> <output>\n", argv[0]);
+    if (argc < 4) {
+        fprintf(stderr, "Using the following command: %s <input> <audio_filename> <video_filename>\n", argv[0]);
         exit(1);
     }
 
     in_filename = argv[1];
-    out_filename = argv[2];
+    audio_out_filename = argv[2];
+    video_out_filename = argv[3];
 
     if ((ret = avformat_open_input(&ifmt_ctx, in_filename, NULL, NULL) < 0)) {
         fprintf(stderr, "Failed to alloc output AVFormatContext: %s\n", av_err2str(ret));
@@ -173,36 +235,65 @@ int main(int argc, char* argv[]) {
     }
     video_stream_index = ret;
 
-    if (!(codec = avcodec_find_decoder(AV_CODEC_ID_AAC))) {
-        fprintf(stderr, "Failed to find AV_CODEC_ID_AAC decoder\n");
+    stream = ifmt_ctx->streams[audio_stream_index];
+    if (!(acodec = avcodec_find_decoder(stream->codecpar->codec_id))) {
+        fprintf(stderr, "Failed to find audio decoder\n");
+        exit(1);
+    }
+    if (!(acodec_ctx = avcodec_alloc_context3(acodec))) {
+        fprintf(stderr, "Failed to alloc audio AVCodecContext\n");
+        exit(1);
+    }
+    if ((ret = avcodec_parameters_to_context(acodec_ctx, stream->codecpar)) < 0) {
+        fprintf(stderr, "Failed to get audio parameters input AVFormatContext\n");
+        exit(1);
+    }
+    if ((ret = avcodec_open2(acodec_ctx, acodec, NULL)) < 0) {
+        fprintf(stderr, "Failed to use audio codec open\n");
         exit(1);
     }
 
-    if (!(codec_ctx = avcodec_alloc_context3(codec))) {
-        fprintf(stderr, "Failed to alloc AVCodecContext\n");
+    stream = ifmt_ctx->streams[video_stream_index];
+    if (!(vcodec = avcodec_find_decoder(stream->codecpar->codec_id))) {
+        fprintf(stderr, "Failed to find audio decoder\n");
         exit(1);
     }
-
-    AVStream* audio_stream = ifmt_ctx->streams[audio_stream_index];
-    ret = avcodec_parameters_to_context(codec_ctx, audio_stream->codecpar);
-
-    if ((ret = avcodec_open2(codec_ctx, codec, NULL)) < 0) {
-        fprintf(stderr, "Failed to use codec open\n");
+    if (!(vcodec_ctx = avcodec_alloc_context3(vcodec))) {
+        fprintf(stderr, "Failed to alloc video AVCodecContext\n");
         exit(1);
     }
-
-    if (!(parser_ctx = av_parser_init(codec->id))) {
-        fprintf(stderr, "Failed to init parser\n");
+    if ((ret = avcodec_parameters_to_context(vcodec_ctx, stream->codecpar)) < 0) {
+        fprintf(stderr, "Failed to get video parameters input AVFormatContext\n");
         exit(1);
     }
+    if ((ret = avcodec_open2(vcodec_ctx, vcodec, NULL)) < 0) {
+        fprintf(stderr, "Failed to use audio codec open\n");
+        exit(1);
+    }
+    /* allocate image where the decoded image will be put */
+    width = vcodec_ctx->width;
+    height = vcodec_ctx->height;
+    pix_fmt = vcodec_ctx->pix_fmt;
+    ret = av_image_alloc(video_dst_data, video_dst_linesize,
+                            width, height, pix_fmt, 1);
+    if (ret < 0) {
+        fprintf(stderr, "Could not allocate raw video buffer\n");
+        goto end;
+    }
+    video_dst_bufsize = ret;
 
     if (!(in_file = fopen(in_filename, "rb"))) {
         fprintf(stderr, "Failed to open input file\n");
         exit(1);
     }
 
-    if (!(out_file = fopen(out_filename, "wb"))) {
-        fprintf(stderr, "Failed to open output file\n");
+    if (!(audio_out_file = fopen(audio_out_filename, "wb"))) {
+        fprintf(stderr, "Failed to open audio output file\n");
+        exit(1);
+    }
+
+    if (!(video_out_file = fopen(video_out_filename, "wb"))) {
+        fprintf(stderr, "Failed to open video output file\n");
         exit(1);
     }
 
@@ -210,76 +301,20 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "failed to alloc AVFrame\n");
         exit(1);
     }
+printf("++++++++++++++\n");
     while (av_read_frame(ifmt_ctx, pkt) >= 0) {
-        if (audio_stream_index = pkt->stream_index) {
+        if (audio_stream_index == pkt->stream_index) {
             if (pkt->size > 0) {
-                decode(codec_ctx, pkt, frame, out_file);
+                decode_audio(acodec_ctx, pkt, frame, audio_out_file);
             }
-        }
-    }
-/*
-    data = buf;
-    data_size = 0;
-
-    while (av_read_frame(ifmt_ctx, pkt) >= 0) {
-        if (audio_stream_index = pkt->stream_index) {
+        } else if (video_stream_index == pkt->stream_index) {
             if (pkt->size > 0) {
-                //AVStream* audio_stream = ifmt_ctx->streams[audio_stream_index];
-                //ret = avcodec_parameters_to_context(codec_ctx, audio_stream->codecpar);
-                get_adts_header(header_buf, pkt->size);
-                memcpy(data + data_size, header_buf, 7);
-                data_size += 7;
-                memcpy(data + data_size, pkt->data, (size_t)pkt->size);
-                data_size += pkt->size;
-            }
-        }
-        av_packet_unref(pkt);
-        if (data_size > STREAM_BUFFER_SIZE) {
-            while (data_size > 0) {
-                ret = av_parser_parse2(parser_ctx, codec_ctx, &pkt->data, &pkt->size, data, data_size, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
-                if (ret < 0) {
-                    fprintf(stderr, "failed to parse parser\n");
-                    exit(1);
-                }
-
-                data = data + ret;
-                data_size = data_size - ret;
-
-                //如果解析后构建packet有数据，则针对packet解码
-                if (pkt->size) {
-                    decode(codec_ctx, pkt, frame, out_file);
-                }
-
-                if (data_size < STREAM_REFRESH_SIZE) {
-                    memmove(buf, data, data_size);
-                    data = buf;
-                    break;
-                }
+                decode_video(vcodec_ctx, pkt, frame, video_out_file);
             }
         }
     }
 
-    while (data_size > 0) {
-        ret = av_parser_parse2(parser_ctx, codec_ctx, &pkt->data, &pkt->size, data, data_size, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
-        if (ret < 0) {
-            fprintf(stderr, "failed to parse parser\n");
-            exit(1);
-        }
-
-        data = data + ret;
-        data_size = data_size - ret;
-
-        //如果解析后构建packet有数据，则针对packet解码
-        if (pkt->size) {
-            decode(codec_ctx, pkt, frame, out_file);
-        }
-    }
-
-    pkt->data = NULL;
-	pkt->size = 0;
-	decode(codec_ctx, pkt, frame, out_file);
-*/
-    sfmt = codec_ctx->sample_fmt;
+    sfmt = acodec_ctx->sample_fmt;
  
     if (av_sample_fmt_is_planar(sfmt)) {
         const char *packed = av_get_sample_fmt_name(sfmt);
@@ -289,23 +324,27 @@ int main(int argc, char* argv[]) {
         sfmt = av_get_packed_sample_fmt(sfmt);
     }
  
-    n_channels = codec_ctx->ch_layout.nb_channels;
+    n_channels = acodec_ctx->ch_layout.nb_channels;
     if ((ret = get_format_from_sample_fmt(&fmt, sfmt)) < 0)
         goto end;
  
     printf("Play the output audio file with the command:\n"
            "ffplay -f %s -ac %d -ar %d %s\n",
-           fmt, n_channels, codec_ctx->sample_rate,
-           out_filename);
+           fmt, n_channels, acodec_ctx->sample_rate,
+           audio_out_filename);
 
 end:
-    fclose(out_file);
+    fclose(video_out_file);
+    fclose(audio_out_file);
     fclose(in_file);
 
-    avcodec_free_context(&codec_ctx);
-    av_parser_close(parser_ctx);
+    avcodec_free_context(&vcodec_ctx);
+    avcodec_free_context(&acodec_ctx);
     av_frame_free(&frame);
     av_packet_free(&pkt);
+    avformat_free_context(ifmt_ctx);
+
+    av_free(video_dst_data[0]);
 
     return 0;
 }
