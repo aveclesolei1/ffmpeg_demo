@@ -186,13 +186,41 @@ void get_adts_header(char* adts_header_buf, const int frame_size) {
     //adts_header_buf = adts_header_buf[5] | 0;
 }
 
+int init_codec_context(AVCodecContext **codec_ctx, AVFormatContext *fmt_ctx, enum AVMediaType type) {
+    const AVStream *stream;
+    const AVCodec *decodec;
+    int ret = -1, stream_index = -1;
+    if ((ret = av_find_best_stream(fmt_ctx, type, -1, -1, NULL, -1)) < 0) {
+        fprintf(stderr, "Failed to find %s stream: %s\n", av_get_media_type_string(type), av_err2str(ret));
+        return ret;
+    }
+    stream_index = ret;
+    stream = fmt_ctx->streams[stream_index];
+    if (!(decodec = avcodec_find_decoder(stream->codecpar->codec_id))) {
+        fprintf(stderr, "Failed to find %s decoder\n", av_get_media_type_string(type));
+        return ret;
+    }
+    if (!(*codec_ctx = avcodec_alloc_context3(decodec))) {
+        fprintf(stderr, "Failed to alloc %s AVCodecContext\n", av_get_media_type_string(type));
+        return ret;
+    }
+    if ((ret = avcodec_parameters_to_context(*codec_ctx, stream->codecpar)) < 0) {
+        fprintf(stderr, "Failed to get %s parameters from input AVFormatContext\n", av_get_media_type_string(type));
+        return ret;
+    }
+    if ((ret = avcodec_open2(*codec_ctx, decodec, NULL)) < 0) {
+        fprintf(stderr, "Failed to use %s decodec open\n", av_get_media_type_string(type));
+        return ret;
+    }
+    return stream_index;
+}
+
 int main(int argc, char* argv[]) {
-    AVFormatContext* ifmt_ctx = NULL, * afmt_ctx = NULL, * vfmt_ctx;
+    AVFormatContext* ifmt_ctx = NULL, * afmt_ctx = NULL, * vfmt_ctx = NULL;
     AVCodecContext* acodec_ctx = NULL, * vcodec_ctx = NULL;
     const AVCodec* acodec = NULL, * vcodec = NULL;
     AVPacket* pkt = NULL;
     AVFrame* frame = NULL;
-    AVStream* stream = NULL;
     FILE* in_file, * audio_out_file, * video_out_file;
     char* in_filename, * audio_out_filename, * video_out_filename, * data;
     char buf[STREAM_BUFFER_SIZE + STREAM_REFRESH_SIZE], header_buf[7];
@@ -218,23 +246,18 @@ int main(int argc, char* argv[]) {
 
     av_dump_format(ifmt_ctx, 0, in_filename, 0);
 
-    if (!(pkt = av_packet_alloc())) {
-        fprintf(stderr, "Failed to alloc AVPacket\n");
+    /* retrieve stream information */
+    if (avformat_find_stream_info(ifmt_ctx, NULL) < 0) {
+        fprintf(stderr, "Could not find stream information\n");
         exit(1);
     }
 
+    /*
     if ((ret = av_find_best_stream(ifmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, -1)) < 0) {
         fprintf(stderr, "Failed to find audio stream: %s\n", av_err2str(ret));
         exit(1);
     }
     audio_stream_index = ret;
-
-    if ((ret = av_find_best_stream(ifmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, -1)) < 0) {
-        fprintf(stderr, "Failed to find video stream: %s\n", av_err2str(ret));
-        exit(1);
-    }
-    video_stream_index = ret;
-
     stream = ifmt_ctx->streams[audio_stream_index];
     if (!(acodec = avcodec_find_decoder(stream->codecpar->codec_id))) {
         fprintf(stderr, "Failed to find audio decoder\n");
@@ -252,7 +275,37 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Failed to use audio codec open\n");
         exit(1);
     }
+    */
 
+    if ((audio_stream_index = init_codec_context(&acodec_ctx, ifmt_ctx, AVMEDIA_TYPE_AUDIO)) < 0) {
+        fprintf(stderr, "Failed to init %s decodec context\n", av_get_media_type_string(AVMEDIA_TYPE_AUDIO));
+        goto end;
+    }
+
+    if ((video_stream_index = init_codec_context(&vcodec_ctx, ifmt_ctx, AVMEDIA_TYPE_VIDEO)) < 0) {
+        fprintf(stderr, "Failed to init %s decodec context\n", av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
+        goto end;
+    } else {
+        /* allocate image where the decoded image will be put */
+        width = vcodec_ctx->width;
+        height = vcodec_ctx->height;
+        pix_fmt = vcodec_ctx->pix_fmt;
+        ret = av_image_alloc(video_dst_data, video_dst_linesize,
+                                width, height, pix_fmt, 1);
+        if (ret < 0) {
+            fprintf(stderr, "Failed to alloc raw video buffer\n");
+            goto end;
+        }
+        video_dst_bufsize = ret;
+    }
+    
+
+    /*
+    if ((ret = av_find_best_stream(ifmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, -1)) < 0) {
+        fprintf(stderr, "Failed to find video stream: %s\n", av_err2str(ret));
+        exit(1);
+    }
+    video_stream_index = ret;
     stream = ifmt_ctx->streams[video_stream_index];
     if (!(vcodec = avcodec_find_decoder(stream->codecpar->codec_id))) {
         fprintf(stderr, "Failed to find audio decoder\n");
@@ -270,17 +323,7 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Failed to use audio codec open\n");
         exit(1);
     }
-    /* allocate image where the decoded image will be put */
-    width = vcodec_ctx->width;
-    height = vcodec_ctx->height;
-    pix_fmt = vcodec_ctx->pix_fmt;
-    ret = av_image_alloc(video_dst_data, video_dst_linesize,
-                            width, height, pix_fmt, 1);
-    if (ret < 0) {
-        fprintf(stderr, "Could not allocate raw video buffer\n");
-        goto end;
-    }
-    video_dst_bufsize = ret;
+    */
 
     if (!(in_file = fopen(in_filename, "rb"))) {
         fprintf(stderr, "Failed to open input file\n");
@@ -297,11 +340,16 @@ int main(int argc, char* argv[]) {
         exit(1);
     }
 
-    if (!(frame = av_frame_alloc())) {
-        fprintf(stderr, "failed to alloc AVFrame\n");
+    if (!(pkt = av_packet_alloc())) {
+        fprintf(stderr, "Failed to alloc AVPacket\n");
         exit(1);
     }
-printf("++++++++++++++\n");
+
+    if (!(frame = av_frame_alloc())) {
+        fprintf(stderr, "Failed to alloc AVFrame\n");
+        exit(1);
+    }
+
     while (av_read_frame(ifmt_ctx, pkt) >= 0) {
         if (audio_stream_index == pkt->stream_index) {
             if (pkt->size > 0) {
@@ -313,6 +361,19 @@ printf("++++++++++++++\n");
             }
         }
     }
+
+    /* flush the decoders */
+    if (acodec_ctx)
+        decode_audio(acodec_ctx, pkt, frame, audio_out_file);
+    if (vcodec_ctx)
+        decode_video(vcodec_ctx, pkt, frame, video_out_file);
+
+    
+    printf("Play the output video file with the command:\n"
+            "ffplay -f rawvideo -pix_fmt %s -video_size %dx%d %s\n",
+            av_get_pix_fmt_name(pix_fmt), width, height,
+            video_out_filename);
+    
 
     sfmt = acodec_ctx->sample_fmt;
  
@@ -334,9 +395,12 @@ printf("++++++++++++++\n");
            audio_out_filename);
 
 end:
-    fclose(video_out_file);
-    fclose(audio_out_file);
-    fclose(in_file);
+    if (video_out_file)
+        fclose(video_out_file);
+    if (audio_out_file)
+        fclose(audio_out_file);
+    if (in_file)
+        fclose(in_file);
 
     avcodec_free_context(&vcodec_ctx);
     avcodec_free_context(&acodec_ctx);
