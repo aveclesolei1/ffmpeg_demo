@@ -14,6 +14,17 @@ static int video_dst_bufsize;
 static int width, height;
 static enum AVPixelFormat pix_fmt;
 
+typedef struct Audio_Parameters {
+    int channels;
+    int sample_rate;
+} Audio_Para;
+
+typedef struct Video_Parameters {
+    int width;
+    int height;
+    double frame_rate;
+} Video_Para;
+
 static int get_format_from_sample_fmt(const char **fmt,
                                       enum AVSampleFormat sample_fmt)
 {
@@ -123,8 +134,9 @@ static void decode_video(AVCodecContext *dec_ctx, AVPacket *pkt, AVFrame *frame,
         av_image_copy(video_dst_data, video_dst_linesize,
                     (const uint8_t **)(frame->data), frame->linesize,
                     pix_fmt, width, height);
-    
         /* write to rawvideo file */
+        //fwrite时只需要video_dst_data[0]是因为，video_dst_data是一个指针数组，
+        //在读取完video_dst_data[0]后会继续读取video_dst_data[1] video_dst_data[2] video_dst_data[3]
         fwrite(video_dst_data[0], 1, video_dst_bufsize, out_file);
     }
 }
@@ -186,6 +198,9 @@ void get_adts_header(char* adts_header_buf, const int frame_size) {
     //adts_header_buf = adts_header_buf[5] | 0;
 }
 
+/*
+** return: Returns the stream index of the lookup type
+*/
 int init_codec_context(AVCodecContext **codec_ctx, AVFormatContext *fmt_ctx, enum AVMediaType type) {
     const AVStream *stream;
     const AVCodec *decodec;
@@ -223,6 +238,8 @@ int main(int argc, char* argv[]) {
     AVFrame* frame = NULL;
     FILE* in_file, * audio_out_file, * video_out_file;
     char* in_filename, * audio_out_filename, * video_out_filename, * data;
+    Video_Para *video_para = NULL;
+    Audio_Para *audio_para = NULL;
     char buf[STREAM_BUFFER_SIZE + STREAM_REFRESH_SIZE], header_buf[7];
     size_t data_size;
     int ret, audio_stream_index, video_stream_index;
@@ -280,6 +297,10 @@ int main(int argc, char* argv[]) {
     if ((audio_stream_index = init_codec_context(&acodec_ctx, ifmt_ctx, AVMEDIA_TYPE_AUDIO)) < 0) {
         fprintf(stderr, "Failed to init %s decodec context\n", av_get_media_type_string(AVMEDIA_TYPE_AUDIO));
         goto end;
+    } else {
+        audio_para = (Audio_Para *) malloc(sizeof(Audio_Para));
+        audio_para->channels = acodec_ctx->ch_layout.nb_channels;
+        audio_para->sample_rate = acodec_ctx->sample_rate;
     }
 
     if ((video_stream_index = init_codec_context(&vcodec_ctx, ifmt_ctx, AVMEDIA_TYPE_VIDEO)) < 0) {
@@ -287,6 +308,10 @@ int main(int argc, char* argv[]) {
         goto end;
     } else {
         /* allocate image where the decoded image will be put */
+        video_para = (Video_Para *) malloc(sizeof(Video_Para));
+        video_para->width = vcodec_ctx->width;
+        video_para->height = vcodec_ctx->height;
+        video_para->frame_rate = av_q2d(ifmt_ctx->streams[video_stream_index]->avg_frame_rate);
         width = vcodec_ctx->width;
         height = vcodec_ctx->height;
         pix_fmt = vcodec_ctx->pix_fmt;
@@ -370,8 +395,8 @@ int main(int argc, char* argv[]) {
 
     
     printf("Play the output video file with the command:\n"
-            "ffplay -f rawvideo -pix_fmt %s -video_size %dx%d %s\n",
-            av_get_pix_fmt_name(pix_fmt), width, height,
+            "ffplay -f rawvideo -framerate %.0f -video_size %dx%d %s\n",
+            video_para->frame_rate, video_para->width, video_para->height,
             video_out_filename);
     
 
@@ -391,7 +416,7 @@ int main(int argc, char* argv[]) {
  
     printf("Play the output audio file with the command:\n"
            "ffplay -f %s -ac %d -ar %d %s\n",
-           fmt, n_channels, acodec_ctx->sample_rate,
+           fmt, audio_para->channels, audio_para->sample_rate,
            audio_out_filename);
 
 end:
