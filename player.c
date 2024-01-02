@@ -13,12 +13,8 @@
 //Break
 #define BREAK_EVENT  (SDL_USEREVENT + 2)
 
-
 #define BUFFER_SIZE 4096000
 #define BUFFER_REFRESH_SIZE 51200
-static Uint8* audio_buffer = NULL;
-static Uint8* audio_position = NULL;
-static size_t audio_buffer_len = 0;
 
 typedef struct AVFrameNode {
     struct AVFrameNode *next;
@@ -41,8 +37,10 @@ typedef struct AudioAndVideoContext {
     int channels;
     int sample_rate;
     AVCodecContext *acodec_ctx;
-    AVFrame *aframe;
     AVPacketQueue *audio_queue;
+    Uint8* audio_buffer;
+    Uint8* audio_position;
+    size_t audio_buffer_len;
 
     //video parameters
     int video_stream_index;
@@ -50,7 +48,6 @@ typedef struct AudioAndVideoContext {
     int height;
     double frame_rate;
     AVCodecContext *vcodec_ctx;
-    AVFrame *vframe;
     enum AVPixelFormat pix_fmt;
     uint8_t *video_dst_data[4];
     int video_dst_linesize[4];
@@ -100,7 +97,7 @@ int add_node(AVPacketQueue *queue, AVFrame *frame) {
     return 0;
 }
 
-void decode_audio(AudioVideoContext* avctx, AVPacket* pkt, AVFrame* frame, FILE* out_file) {
+void decode_audio(AudioVideoContext* avctx, AVPacket* pkt) {
 	int i, ch;
 	int ret, data_size;
 
@@ -111,6 +108,7 @@ void decode_audio(AudioVideoContext* avctx, AVPacket* pkt, AVFrame* frame, FILE*
 	}
 
 	while (ret >= 0) {
+        AVFrame *frame = av_frame_alloc();
 		ret = avcodec_receive_frame(avctx->acodec_ctx, frame);
 		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
             return;
@@ -119,17 +117,11 @@ void decode_audio(AudioVideoContext* avctx, AVPacket* pkt, AVFrame* frame, FILE*
             exit(1);
         } 
 
-		data_size = av_get_bytes_per_sample(avctx->acodec_ctx->sample_fmt);
-        if (data_size < 0) {
-            /* This should not occur, checking just for paranoia */
-            fprintf(stderr, "Failed to calculate data size\n");
-            exit(1);
+        while (avctx->audio_queue->count > 10000) {
+            SDL_Delay(20);
         }
-        
-        for (i = 0; i < frame->nb_samples; i++)
-			for (ch = 0; ch < avctx->acodec_ctx->ch_layout.nb_channels; ch++) {
-                fwrite(frame->data[ch] + data_size*i, 1, data_size, out_file);
-            }
+        add_node(avctx->audio_queue, frame);
+        fprintf(stderr, "add_node: the count is: %d\n", avctx->audio_queue->count);
 	}
 }
 
@@ -257,7 +249,8 @@ int demux_and_decode(void *argv) {
     while (av_read_frame(fmt_ctx, pkt) >= 0) {
         if (avctx->audio_stream_index == pkt->stream_index) {
             if (pkt->size > 0) {
-                //add_node(avctx->audio_queue, pkt);
+                fprintf(stderr, "decode_audio\n");
+                decode_audio(avctx, pkt);
             }
         } else if (avctx->video_stream_index == pkt->stream_index) {
             if (pkt->size > 0) {
@@ -276,17 +269,23 @@ end:
 }
 
 void read_audio_data(void* udata, Uint8* stream, int len) {
-	if (audio_buffer_len == 0) {
+    AudioVideoContext *avctx = (AudioVideoContext *) udata;
+
+    if (avctx->audio_queue->count == 0) {
+        SDL_Delay(200);
+    }
+
+	if (avctx->audio_buffer_len == 0) {
 		return;
 	}
 
 	SDL_memset(stream, 0, len);
 
-	len = (len < audio_buffer_len) ? len : audio_buffer_len;
-	SDL_MixAudio(stream, audio_position, len, SDL_MIX_MAXVOLUME);
+	len = (len < avctx->audio_buffer_len) ? len : avctx->audio_buffer_len;
+	SDL_MixAudio(stream, avctx->audio_position, len, SDL_MIX_MAXVOLUME);
 
-	audio_position += len;
-	audio_buffer_len -= len;
+	avctx->audio_position += len;
+	avctx->audio_buffer_len -= len;
 }
 
 int refresh_audio_data(void *argv) {
@@ -296,20 +295,25 @@ int refresh_audio_data(void *argv) {
         return -1;
     }
     avctx = (AudioVideoContext *)argv;
-    /*
-    audio_buffer = (Uint8*) malloc(BUFFER_SIZE);
-	if (!audio_buffer) {
+    
+    avctx->audio_buffer = (Uint8*) malloc(BUFFER_SIZE);
+	if (!avctx->audio_buffer) {
 		fprintf(stderr, "Failed to malloc buffer\n");
 		return -1;
 	}
+    avctx->audio_buffer_len = 0;
+    avctx->audio_position = avctx->audio_buffer;
+
+    //
+    SDL_Delay(3000);
 
 	SDL_AudioSpec spec;
-	spec.freq = 48000;
-	spec.channels = 2;
+	spec.freq = avctx->sample_rate;
+	spec.channels = avctx->channels;
 	spec.format = AUDIO_F32LSB;
 	spec.silence = 0;
 	spec.callback = read_audio_data;
-	spec.userdata = NULL;
+	spec.userdata = avctx;
 	
 	if (SDL_OpenAudio(&spec, NULL)) {
 		fprintf(stderr, "Failed to open audio file\n");
@@ -318,32 +322,53 @@ int refresh_audio_data(void *argv) {
 
 	SDL_PauseAudio(0);
     
-    size_t read_length = fread(audio_buffer, 1, BUFFER_SIZE, audio_file);
-	audio_position = audio_buffer;
-	audio_buffer_len = read_length;
+    do {
+        while (1) {
+            fprintf(stderr, "peek node\n");
+            if (!peek_node(avctx->audio_queue)) {
+                SDL_Delay(500);
+            }
+            AVFrameNode *node = peek_node(avctx->audio_queue);
+            AVFrame *frame = node->frame;
+            size_t data_size = av_get_bytes_per_sample(avctx->acodec_ctx->sample_fmt);
+            if (data_size < 0) {
+                /* This should not occur, checking just for paranoia */
+                fprintf(stderr, "Failed to calculate data size\n");
+                exit(1);
+            }
 
-    while(1) {
-        if (read_length <= 0) {
-                printf("there are audio_buffer_len: %zu\n", audio_buffer_len);
+            if (data_size * avctx->channels > BUFFER_SIZE - avctx->audio_buffer_len) {
                 break;
+            } else {
+                remove_node(avctx->audio_queue);
+            }
+            
+            for (int i = 0; i < frame->nb_samples; i++) {
+                for (int ch = 0; ch < avctx->acodec_ctx->ch_layout.nb_channels; ch++) {
+                    memcpy(avctx->audio_buffer + avctx->audio_buffer_len, frame->data[ch] + data_size*i, data_size);
+                    avctx->audio_buffer_len += data_size;
+                }
             }
 
-            while (audio_buffer_len > BUFFER_REFRESH_SIZE) {
-                SDL_Delay(1);
-            }
+            av_free(&frame);
+            free(node);
+        }
 
-            memmove(audio_buffer, audio_position, audio_buffer_len);
-            audio_position = audio_buffer;
-            read_length = fread(audio_buffer + audio_buffer_len, 1, BUFFER_SIZE - audio_buffer_len, audio_file);
-            if (read_length > 0) {
-                audio_buffer_len += read_length;
-            }
-    }
-    if (audio_buffer) {
-		free(audio_buffer);
+        while (avctx->audio_buffer_len > BUFFER_REFRESH_SIZE) {
+            SDL_Delay(1);
+        }
+
+        memmove(avctx->audio_buffer, avctx->audio_position, avctx->audio_buffer_len);
+        avctx->audio_position = avctx->audio_buffer;
+    } while(avctx->audio_buffer_len > 0);
+
+    //todo: the remaining audio data needs to be played
+
+    if (avctx->audio_buffer) {
+		free(avctx->audio_buffer);
 	}
+
     return 0;
-    */
 }
 
 int refresh_video_data(void *argv) {
@@ -378,15 +403,6 @@ AudioVideoContext* alloc_audio_video_context() {
         return NULL;
     }
 
-    if (!(avctx->aframe = av_frame_alloc())) {
-        fprintf(stderr, "Failed to alloc audio AVFrame\n");
-        return NULL;
-    }
-    if (!(avctx->vframe = av_frame_alloc())) {
-        fprintf(stderr, "Failed to alloc video AVFrame\n");
-        return NULL;
-    }
-
     avctx->audio_queue = (AVPacketQueue *) malloc(sizeof(AVPacketQueue));
     avctx->audio_queue->count = 0;
     avctx->video_queue = (AVPacketQueue *) malloc(sizeof(AVPacketQueue));
@@ -401,14 +417,13 @@ void free_audio_video_context(AudioVideoContext* avctx) {
     if (!avctx) {
         return;
     }
-    av_frame_free(&avctx->aframe);
-    av_frame_free(&avctx->vframe);
 
     free(avctx->audio_queue);
     free(avctx->video_queue);
 
     free(avctx->video_dst_data[0]);
     //free(avctx->video_dst_linesize[0]);
+
     free(avctx);
 }
 
@@ -448,7 +463,8 @@ int main(int argc, char *argv[]) {
         goto end;
     }
 
-    if (!(texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_YV12, 
+    //videos in yuv420p format need to use SDL_PIXELFORMAT_IYUV as the texture format
+    if (!(texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_IYUV, 
         SDL_TEXTUREACCESS_STREAMING, WINDOW_DEFAULT_WIDTH, WINDOW_DEFAULT_HEIGHT))) {
         fprintf(stderr, "Failed to create texture\n");
         goto end;
@@ -465,19 +481,17 @@ int main(int argc, char *argv[]) {
         goto end;
     }
     //
-    SDL_Delay(100);
+    SDL_Delay(500);
     
     if (!(refresh_video_thread = SDL_CreateThread(refresh_video_data, "refresh_video_thread", avctx))) {
         fprintf(stderr, "Failed to create refresh_video_thread: %s\n", SDL_GetError());
         goto end;
     }
 
-    /*
     if (!(refresh_audio_thread = SDL_CreateThread(refresh_audio_data, "refresh_audio_thread", avctx))) {
         fprintf(stderr, "Failed to create refresh_audio_thread: %s\n", SDL_GetError());
         goto end;
     }
-    */
 
     buffer = (char *) malloc(avctx->width * avctx->height * 3 / 2);
 
@@ -495,8 +509,7 @@ int main(int argc, char *argv[]) {
                     (const uint8_t **)(frame->data), frame->linesize,
                     avctx->pix_fmt, avctx->width, avctx->height);
                 
-                memccpy(buffer, avctx->video_dst_data[0], 1, avctx->video_dst_bufsize);
-                
+                memcpy(buffer, avctx->video_dst_data[0], avctx->video_dst_bufsize);
                 SDL_UpdateTexture(texture, NULL, buffer, avctx->width);
                 av_frame_free(&frame);
                 free(node);
