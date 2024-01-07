@@ -16,21 +16,31 @@
 #define BUFFER_SIZE 4096000
 #define BUFFER_REFRESH_SIZE 51200
 
-typedef struct AVFrameNode {
-    struct AVFrameNode *next;
-    AVFrame *frame;
-} AVFrameNode;
+static unsigned int pkt_num = 0;
+
+typedef struct AVPacketNode {
+    struct AVPacketNode *next;
+    AVPacket *pkt;
+} AVPacketNode;
 
 typedef struct LinkedListAVPacketQueue {
-    AVFrameNode *head;
-    AVFrameNode *tail;
-    AVFrameNode *node;
+    AVPacketNode *head;
+    AVPacketNode *tail;
+    AVPacketNode *node;
     size_t count;
     const size_t max_size;
 } AVPacketQueue;
 
+typedef struct ArrayAVFrameQueue {
+    AVFrame *frame_array[30];
+    unsigned int head_index;
+    unsigned int tail_index;
+    size_t count;
+} AVFrameQueue;
+
 typedef struct AudioAndVideoContext {
     char *file_name;
+    double delay_mills;
 
     //audio parameters
     int audio_stream_index;
@@ -52,6 +62,7 @@ typedef struct AudioAndVideoContext {
     uint8_t *video_dst_data[4];
     int video_dst_linesize[4];
     int video_dst_bufsize;
+    AVFrameQueue *frame_queue;
     AVPacketQueue *video_queue;
 
     int quit;
@@ -61,30 +72,30 @@ static int getCount(AVPacketQueue *queue) {
     return queue->count;
 }
 
-static AVFrameNode* peek_node(AVPacketQueue *queue) {
+static AVPacketNode* peek_node(AVPacketQueue *queue) {
     if (!queue || queue->count == 0) {
         return NULL;
     }
     return queue->head;
 }
 
-static AVFrameNode* remove_node(AVPacketQueue *queue) {
+static AVPacketNode* remove_node(AVPacketQueue *queue) {
     if (!queue || queue->count == 0) {
         return NULL;
     }
-    AVFrameNode *top = queue->head;
+    AVPacketNode *top = queue->head;
     queue->head = top->next;
     queue->count--;
     return top;
 }
 
 //return: succeed >= 0 or failed < 0
-int add_node(AVPacketQueue *queue, AVFrame *frame) {
+int add_node(AVPacketQueue *queue, AVPacket *pkt) {
     if (!queue) {
         return -1;
     }
-    AVFrameNode *node = (AVFrameNode *) malloc(sizeof(AVFrameNode));
-    node->frame = frame;
+    AVPacketNode *node = (AVPacketNode *) malloc(sizeof(AVPacketNode));
+    node->pkt = pkt;
     node->next = NULL;
     if (queue->count == 0) {
         queue->head = node;
@@ -97,58 +108,111 @@ int add_node(AVPacketQueue *queue, AVFrame *frame) {
     return 0;
 }
 
-void decode_audio(AudioVideoContext* avctx, AVPacket* pkt) {
-	int i, ch;
-	int ret, data_size;
+void decode_audio(AudioVideoContext* avctx) {
+    AVFrame *frame;
+    Uint8 *temp_buffer;
+	int i, ch, ret, data_size, temp_buffer_len;
 
-	ret = avcodec_send_packet(avctx->acodec_ctx, pkt);
-	if (ret < 0) {
-		printf("Failed to send packet: %s\n", av_err2str(ret));
-	    exit(1);
-	}
+    //将未播放的音频数据从audio_buffer尾部移至头部
+    memmove(avctx->audio_buffer, avctx->audio_position, avctx->audio_buffer_len);
+    avctx->audio_position = avctx->audio_buffer;
 
-	while (ret >= 0) {
-        AVFrame *frame = av_frame_alloc();
-		ret = avcodec_receive_frame(avctx->acodec_ctx, frame);
-		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-            return;
-		} else if (ret < 0) {
-            fprintf(stderr, "failed to receive frame\n");
+    if (!(frame = av_frame_alloc())) {
+        fprintf(stderr, "Failed to alloc AVFrame when decode audio\n");
+        return;
+    }
+
+    temp_buffer = (Uint8 *) malloc(BUFFER_SIZE - BUFFER_REFRESH_SIZE);
+    temp_buffer_len = 0;
+
+    //解码BUFFER_SIZE - 2 * BUFFER_REFRESH_SIZE长度的音频数据放入temp_buffer_len中
+    while (temp_buffer_len < BUFFER_SIZE - 2 * BUFFER_REFRESH_SIZE && avctx->audio_queue->count > 0) {
+        //从音频packet队列中取出一个packet
+        AVPacketNode *node = remove_node(avctx->audio_queue);
+
+        ret = avcodec_send_packet(avctx->acodec_ctx, node->pkt);
+        if (ret < 0) {
+            printf("Failed to send packet: %s\n", av_err2str(ret));
             exit(1);
-        } 
-
-        while (avctx->audio_queue->count > 10000) {
-            SDL_Delay(20);
         }
-        add_node(avctx->audio_queue, frame);
-        fprintf(stderr, "add_node: the count is: %d\n", avctx->audio_queue->count);
-	}
+        
+        while (ret >= 0) {
+            ret = avcodec_receive_frame(avctx->acodec_ctx, frame);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                break;
+            } else if (ret < 0) {
+                fprintf(stderr, "failed to receive frame\n");
+                exit(1);
+            }
+            data_size = av_get_bytes_per_sample(avctx->acodec_ctx->sample_fmt);
+            if (data_size < 0) {
+                /* This should not occur, checking just for paranoia */
+                fprintf(stderr, "Failed to calculate data size\n");
+                exit(1);
+            }
+
+            for (int i = 0; i < frame->nb_samples; i++) {
+                for (int ch = 0; ch < avctx->acodec_ctx->ch_layout.nb_channels; ch++) {
+                    memmove(temp_buffer + temp_buffer_len, frame->data[ch] + data_size*i, data_size);
+                    temp_buffer_len += data_size;
+                }
+            }
+        }
+
+        av_packet_free(&node->pkt);
+        free(node);
+    }
+
+    //将temp_buffer暂存区中的数据放入audio_buffer音频缓冲区
+    if (temp_buffer) {
+        if (temp_buffer_len <= 0) {
+            fprintf(stderr, "the strlen(buffer) <= 0\n");
+            return;
+        }
+
+        memmove(avctx->audio_buffer + avctx->audio_buffer_len, temp_buffer, temp_buffer_len);
+        avctx->audio_buffer_len += temp_buffer_len;
+    }
+
+    av_frame_free(&frame);
+    free(temp_buffer);
 }
 
 static void decode_video(AudioVideoContext *avctx, AVPacket *pkt)
 {
     int ret;
-    ret = avcodec_send_packet(avctx->vcodec_ctx, pkt);
-    if (ret < 0) {
-        fprintf(stderr, "Error sending a packet for decoding: %s\n", av_err2str(ret));
-        exit(1);
-    }
-    
-    while (ret >= 0) {
-        AVFrame *frame = av_frame_alloc();
-        ret = avcodec_receive_frame(avctx->vcodec_ctx, frame);
-        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-            return;
-        else if (ret < 0) {
-            fprintf(stderr, "Error during decoding\n");
+    //fprintf(stderr, "the count is %d\n", avctx->frame_queue->count);
+    if (avctx->frame_queue->count <= 25 /*&& avctx->video_queue->count > 1*/) {
+        AVPacket *packet = pkt;//remove_node(avctx->video_queue)->pkt;
+        ret = avcodec_send_packet(avctx->vcodec_ctx, packet);
+        if (ret < 0) {
+            fprintf(stderr, "Error sending a packet for decoding: %s\n", av_err2str(ret));
             exit(1);
         }
-
-        while (avctx->video_queue->count > 10) {
-            SDL_Delay(16.67);
+        
+        while (ret >= 0) {
+            AVFrame *frame = av_frame_alloc();
+            ret = avcodec_receive_frame(avctx->vcodec_ctx, frame);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                //av_frame_free(&frame);
+                return;
+            } else if (ret < 0) {
+                fprintf(stderr, "Error during decoding\n");
+                exit(1);
+            }
+            //fprintf(stderr, "the avctx->frame_queue->tail_index is %d\n", avctx->frame_queue->tail_index);
+            avctx->frame_queue->frame_array[avctx->frame_queue->tail_index] = frame;
+            avctx->frame_queue->count++;
+            avctx->frame_queue->tail_index = (avctx->frame_queue->tail_index + 1) % 30;
         }
-        add_node(avctx->video_queue, frame);
+        
+        //av_packet_free(&packet);
     }
+    /*if (avctx->video_queue->count > 25) {
+        //wait for other thread wake
+        SDL_Delay(16.67);
+    }*/
+    //add_node(avctx->video_queue, pkt);
 }
 
 /*
@@ -240,29 +304,41 @@ int demux_and_decode(void *argv) {
         fprintf(stderr, "Failed to open input file\n");
         goto end;
     }
-
     if (!(pkt = av_packet_alloc())) {
         fprintf(stderr, "Failed to alloc AVPacket\n");
         goto end;
     }
 
+    avctx->delay_mills = 1000 / avctx->frame_rate;
+
     while (av_read_frame(fmt_ctx, pkt) >= 0) {
         if (avctx->audio_stream_index == pkt->stream_index) {
             if (pkt->size > 0) {
-                fprintf(stderr, "decode_audio\n");
-                decode_audio(avctx, pkt);
+                while (avctx->audio_queue->count > 60) {
+                    SDL_Delay(avctx->delay_mills);
+                }
+                add_node(avctx->audio_queue, pkt);
             }
         } else if (avctx->video_stream_index == pkt->stream_index) {
             if (pkt->size > 0) {
+                while (avctx->frame_queue->count > 25) {
+                    SDL_Delay(avctx->delay_mills);
+                }
                 decode_video(avctx, pkt);
             }
+        }
+
+        if (!(pkt = av_packet_alloc())) {
+            fprintf(stderr, "Failed to alloc AVPacket\n");
+            goto end;
         }
     }
 
 end:
     av_packet_free(&pkt);
-    if (file)
+    if (file) {
         fclose(file);
+    }
     avformat_free_context(fmt_ctx);
 
     return 0;
@@ -271,11 +347,7 @@ end:
 void read_audio_data(void* udata, Uint8* stream, int len) {
     AudioVideoContext *avctx = (AudioVideoContext *) udata;
 
-    if (avctx->audio_queue->count == 0) {
-        SDL_Delay(200);
-    }
-
-	if (avctx->audio_buffer_len == 0) {
+	if (avctx->audio_buffer_len <= 0) {
 		return;
 	}
 
@@ -304,9 +376,6 @@ int refresh_audio_data(void *argv) {
     avctx->audio_buffer_len = 0;
     avctx->audio_position = avctx->audio_buffer;
 
-    //
-    SDL_Delay(3000);
-
 	SDL_AudioSpec spec;
 	spec.freq = avctx->sample_rate;
 	spec.channels = avctx->channels;
@@ -320,47 +389,22 @@ int refresh_audio_data(void *argv) {
 		return -1;
 	}
 
+    // wait decoder thread
+    while (avctx->audio_queue->count < 0) {
+        SDL_Delay(1);
+    }
+
 	SDL_PauseAudio(0);
-    
+
     do {
-        while (1) {
-            fprintf(stderr, "peek node\n");
-            if (!peek_node(avctx->audio_queue)) {
-                SDL_Delay(500);
-            }
-            AVFrameNode *node = peek_node(avctx->audio_queue);
-            AVFrame *frame = node->frame;
-            size_t data_size = av_get_bytes_per_sample(avctx->acodec_ctx->sample_fmt);
-            if (data_size < 0) {
-                /* This should not occur, checking just for paranoia */
-                fprintf(stderr, "Failed to calculate data size\n");
-                exit(1);
-            }
-
-            if (data_size * avctx->channels > BUFFER_SIZE - avctx->audio_buffer_len) {
-                break;
-            } else {
-                remove_node(avctx->audio_queue);
-            }
-            
-            for (int i = 0; i < frame->nb_samples; i++) {
-                for (int ch = 0; ch < avctx->acodec_ctx->ch_layout.nb_channels; ch++) {
-                    memcpy(avctx->audio_buffer + avctx->audio_buffer_len, frame->data[ch] + data_size*i, data_size);
-                    avctx->audio_buffer_len += data_size;
-                }
-            }
-
-            av_free(&frame);
-            free(node);
-        }
-
+        //如果音频缓冲区的数据量大于BUFFER_REFRESH_SIZE，则持续等待声卡消费音频数据
         while (avctx->audio_buffer_len > BUFFER_REFRESH_SIZE) {
-            SDL_Delay(1);
+            SDL_Delay(avctx->delay_mills);
         }
 
-        memmove(avctx->audio_buffer, avctx->audio_position, avctx->audio_buffer_len);
-        avctx->audio_position = avctx->audio_buffer;
-    } while(avctx->audio_buffer_len > 0);
+        decode_audio(avctx);
+        
+    } while(avctx->quit != 1);
 
     //todo: the remaining audio data needs to be played
 
@@ -380,13 +424,13 @@ int refresh_video_data(void *argv) {
     }
     avctx = (AudioVideoContext *)argv;
     avctx->quit = 0;
-    delay_mills = 1000 / avctx->frame_rate;
+
     while (avctx->quit == 0) {
         //每隔delay_mills毫秒推送一次刷新事件
         SDL_Event event;
         event.type = REFRESH_EVENT;
         SDL_PushEvent(&event);
-        SDL_Delay(delay_mills);
+        SDL_Delay(avctx->delay_mills);
     }
     avctx->quit = 0;
     //break
@@ -408,8 +452,13 @@ AudioVideoContext* alloc_audio_video_context() {
     avctx->video_queue = (AVPacketQueue *) malloc(sizeof(AVPacketQueue));
     avctx->video_queue->count = 0;
 
+    avctx->frame_queue = (AVFrameQueue *) malloc(sizeof(AVFrameQueue));
+    avctx->frame_queue->count=0;
+    avctx->frame_queue->head_index = 0;
+    avctx->frame_queue->tail_index = 0;
+
     avctx->video_dst_data[0] = (uint8_t *) malloc(sizeof(uint8_t *) * 4);
-    //avctx->video_dst_linesize[0] = (int) malloc(sizeof(int) * 4);
+
     return avctx;
 }
 
@@ -475,6 +524,7 @@ int main(int argc, char *argv[]) {
         goto end;
     }
     avctx->file_name = "D:\\Server\\c_code\\build\\source.mp4";//argv[1];
+    SDL_Delay(100);
 
     if (!(demux_decode_thread = SDL_CreateThread(demux_and_decode, "demux_decode_thread", avctx))) {
         fprintf(stderr, "Failed to create demux_decode_thread: %s\n", SDL_GetError());
@@ -502,17 +552,20 @@ int main(int argc, char *argv[]) {
         if (event.type == REFRESH_EVENT) {
             //这里是读取一帧视频真，数据格式是YUV420P，像素排列是4:2:0，一行像素=width*height+width*1/4+height*1/4 = width*height*3/2
             //所以下面这句话刚好就是读取了一个视频帧YUV的数据长度
-            if (avctx->video_queue->count > 0) {
-                AVFrameNode *node = remove_node(avctx->video_queue);
-                AVFrame *frame = node->frame;
+            //fprintf(stderr, "the size is %d\n", avctx->frame_queue->count);
+            if (avctx->frame_queue->count > 0) {
+                AVFrame *frame = avctx->frame_queue->frame_array[avctx->frame_queue->head_index];
+
                 av_image_copy(avctx->video_dst_data, avctx->video_dst_linesize,
                     (const uint8_t **)(frame->data), frame->linesize,
                     avctx->pix_fmt, avctx->width, avctx->height);
-                
+
                 memcpy(buffer, avctx->video_dst_data[0], avctx->video_dst_bufsize);
-                SDL_UpdateTexture(texture, NULL, buffer, avctx->width);
+                avctx->frame_queue->count--;
+                avctx->frame_queue->head_index  = (avctx->frame_queue->head_index + 1) % 30;
                 av_frame_free(&frame);
-                free(node);
+
+                SDL_UpdateTexture(texture, NULL, buffer, avctx->width);
                 rect.x = 0;
                 rect.y = 0;
                 rect.w = WINDOW_DEFAULT_WIDTH;
